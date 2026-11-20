@@ -17,11 +17,20 @@ to sane ranges so a noisy early segment cannot extrapolate to nonsense.
 
 The spread around each median is a logit-normal sigma built from the
 baseline random-walk term 0.5*sqrt(horizon days), the model's own
-in-sample logit residuals, and a term that grows with how far the
-target extrapolates past the last observed log-time, widened further
-when the history has not yet shown a single refresh (dilution risk
-unobserved). Quantiles come from the standard normal z values at the
-case's levels.
+in-sample logit residuals, a term that grows with how far the target
+extrapolates past the last observed log-time, and the observed refresh
+volatility: the typical absolute logit move a trophy's rate makes when
+the page refreshes and the tracked-player count jumps. A history with
+no refresh at all earns a narrow (but never zero) floor, since a flat
+page has shown no dilution; a history whose refreshes move rates a lot
+keeps a wide spread. Quantiles come from the standard normal z values
+at the case's levels.
+
+Each median also blends the ratio forecast with the trophy's last
+observed rate, in logit space. When the history shows no refresh, the
+last rate is nearly the whole story and carries most of the weight;
+once refreshes are on record the ratio forecast dominates and the last
+rate is only an anchor against extrapolation overshoot.
 
 Standard library only, no network, deterministic: the same case always
 produces the same bytes.
@@ -57,10 +66,26 @@ RESID_SPREAD_FACTOR = 1.5
 # Extra spread per unit of log-time the target lies past the last read:
 # trend error compounds the further the curves are extrapolated.
 EXTRAP_SPREAD_PER_LOGTIME = 0.35
-# Minimum spread when the history has never shown a refresh.
-UNREFRESHED_SIGMA = 1.1
+# How much the observed per-refresh logit volatility widens the spread.
+# Half weight: the residual term already prices the refreshes the
+# smooth curves failed to fit in sample, so this term only adds the
+# forward-looking share of dilution uncertainty.
+VOL_SPREAD_FACTOR = 0.5
+# Spread floor for a history with no refresh at all: a flat page has
+# shown no dilution, so the band may be narrow, but never zero. The
+# floor also grows with the horizon (see sigma_floor), so a long
+# unrefreshed history still prices unobserved dilution risk.
+FLAT_SIGMA_FLOOR = 0.4
+# Spread floor once at least one refresh is on record.
+REFRESHED_SIGMA_FLOOR = 0.5
 # Hard cap on any trophy's logit spread.
 SIGMA_CAP = 3.0
+# Weight on the last observed rate in the median blend (logit space).
+# A flat history: the last rate carries most of the weight. Each
+# refresh on record hands weight to the ratio forecast, down to the
+# minimum anchor weight.
+PERSIST_WEIGHT_FLAT = 0.85
+PERSIST_WEIGHT_MIN = 0.3
 
 
 def clamp_rate(pct):
@@ -131,6 +156,58 @@ def distinct_states(history):
     return states
 
 
+def refresh_stats(states):
+    """Count refreshes and measure their typical logit move.
+
+    A refresh is a distinct page state whose players_tracked differs
+    from the previous state's. The volatility is the median absolute
+    logit change across every trophy observed on both sides of every
+    refresh boundary: how far a rate typically jumps when the tracked
+    cohort is diluted. Returns (n_refresh, volatility), volatility 0.0
+    when no refresh (or no comparable trophy) is on record.
+    """
+    moves = []
+    n_refresh = 0
+    for prev, cur in zip(states, states[1:]):
+        p_prev = prev.get("players_tracked")
+        p_cur = cur.get("players_tracked")
+        if not p_prev or not p_cur or float(p_prev) == float(p_cur):
+            continue
+        n_refresh += 1
+        rates_prev = prev.get("rates") or []
+        rates_cur = cur.get("rates") or []
+        for a, b in zip(rates_prev, rates_cur):
+            if a is not None and b is not None:
+                moves.append(abs(logit(float(b)) - logit(float(a))))
+    if not moves:
+        return n_refresh, 0.0
+    moves.sort()
+    mid = len(moves) // 2
+    if len(moves) % 2:
+        return n_refresh, moves[mid]
+    return n_refresh, 0.5 * (moves[mid - 1] + moves[mid])
+
+
+def sigma_floor(days, n_refresh):
+    """Minimum logit spread for a case, by horizon and refresh record.
+
+    No refresh on record: the flat floor, but never below the baseline
+    random walk for the horizon, so a long unrefreshed history still
+    prices the dilution it has not yet shown. With refreshes on
+    record, a modest fixed floor; the quadrature terms do the rest.
+    """
+    if n_refresh <= 0:
+        return max(FLAT_SIGMA_FLOOR, 0.5 * math.sqrt(days))
+    return REFRESHED_SIGMA_FLOOR
+
+
+def persist_weight(n_refresh):
+    """Weight on the last observed rate in the median blend."""
+    if n_refresh <= 0:
+        return PERSIST_WEIGHT_FLAT
+    return max(PERSIST_WEIGHT_MIN, PERSIST_WEIGHT_FLAT / (1.0 + n_refresh))
+
+
 def read_time_hours(read):
     stamp = read.get("at") or read.get("slot")
     return hours_since_epoch(parse_time(stamp))
@@ -184,7 +261,7 @@ def last_known_rates(case):
 def persistence_rows(case, levels):
     """Fallback forecast: last rate held flat, baseline random-walk spread."""
     days = horizon_days(case)
-    sigma = max(0.5 * math.sqrt(days), UNREFRESHED_SIGMA)
+    sigma = max(0.5 * math.sqrt(days), sigma_floor(days, 0))
     last = last_known_rates(case)
     known = sorted(r for r in last if r is not None)
     fill = known[len(known) // 2] if known else 1.0
@@ -212,13 +289,11 @@ def forecast_case(case):
 
     # --- players-tracked curve: ln(players) against log-time ---
     p_xs, p_ys, p_ws = [], [], []
-    players_seen = set()
     last_players = None
     for state, x, w in zip(states, xs, weights):
         players = state.get("players_tracked")
         if players:
             players = float(players)
-            players_seen.add(players)
             last_players = players
             p_xs.append(x)
             p_ys.append(math.log(players))
@@ -238,8 +313,11 @@ def forecast_case(case):
             return max(math.exp(players_fit[0] + players_fit[1] * x), 1.0)
         return players_forecast
 
-    base_sigma = 0.5 * math.sqrt(horizon_days(case))
-    never_refreshed = len(players_seen) <= 1
+    days = horizon_days(case)
+    base_sigma = 0.5 * math.sqrt(days)
+    n_refresh, refresh_vol = refresh_stats(states)
+    case_floor = sigma_floor(days, n_refresh)
+    w_persist = persist_weight(n_refresh)
     last_rates = last_known_rates(case)
     known_rates = sorted(r for r in last_rates if r is not None)
     fill_rate = known_rates[len(known_rates) // 2] if known_rates else 1.0
@@ -265,7 +343,7 @@ def forecast_case(case):
         if earners_fit is None:
             # Too little usable history: hold the last rate, spread wide.
             median = last_rates[i] if last_rates[i] is not None else fill_rate
-            sigma = max(base_sigma, UNREFRESHED_SIGMA)
+            sigma = max(base_sigma, case_floor)
             rows.append({"id": trophy["id"], "q": quantiles_from(median, sigma, levels)})
             continue
 
@@ -282,6 +360,14 @@ def forecast_case(case):
         earners_forecast = min(max(earners_forecast, 0.0), players_forecast)
         median = clamp_rate(100.0 * earners_forecast / players_forecast)
 
+        # Anchor the median to the last observed rate, in logit space.
+        # On a flat history the last rate carries most of the weight;
+        # with refreshes on record the ratio forecast dominates and
+        # the anchor only reins in extrapolation overshoot.
+        if last_rates[i] is not None:
+            blended = (1.0 - w_persist) * logit(median) + w_persist * logit(last_rates[i])
+            median = clamp_rate(inv_logit(blended))
+
         # In-sample logit residuals of the ratio model, for the spread.
         sq = 0.0
         n_resid = 0
@@ -296,11 +382,14 @@ def forecast_case(case):
         resid_std = math.sqrt(sq / n_resid) if n_resid >= 2 else 0.0
 
         extrap = EXTRAP_SPREAD_PER_LOGTIME * max(0.0, x_target - max(xs))
+        vol = VOL_SPREAD_FACTOR * refresh_vol
         sigma = math.sqrt(
-            base_sigma ** 2 + (RESID_SPREAD_FACTOR * resid_std) ** 2 + extrap ** 2
+            base_sigma ** 2
+            + (RESID_SPREAD_FACTOR * resid_std) ** 2
+            + extrap ** 2
+            + vol ** 2
         )
-        if never_refreshed:
-            sigma = max(sigma, UNREFRESHED_SIGMA)
+        sigma = max(sigma, case_floor)
         sigma = min(sigma, SIGMA_CAP)
 
         rows.append({"id": trophy["id"], "q": quantiles_from(median, sigma, levels)})
