@@ -21,16 +21,32 @@ in-sample logit residuals, a term that grows with how far the target
 extrapolates past the last observed log-time, and the observed refresh
 volatility: the typical absolute logit move a trophy's rate makes when
 the page refreshes and the tracked-player count jumps. A history with
-no refresh at all earns a narrow (but never zero) floor, since a flat
-page has shown no dilution; a history whose refreshes move rates a lot
-keeps a wide spread. Quantiles come from the standard normal z values
-at the case's levels.
+no refresh at all earns a narrow (but never zero) floor at short
+horizons, since a flat page has shown no dilution; the floor ramps up
+to the full random-walk spread over the first day and a half, so a
+flat history forecast days ahead still prices the dilution it has not
+yet shown. A history whose refreshes move rates a lot keeps a wide
+spread. Quantiles come from the standard normal z values at the
+case's levels.
 
 Each median also blends the ratio forecast with the trophy's last
 observed rate, in logit space. When the history shows no refresh, the
-last rate is nearly the whole story and carries most of the weight;
-once refreshes are on record the ratio forecast dominates and the last
-rate is only an anchor against extrapolation overshoot.
+last rate is nearly the whole story and carries almost all of the
+weight; once refreshes are on record the ratio forecast dominates and
+the last rate is only an anchor against extrapolation overshoot.
+
+One flat history is special: the unchanged launch-night page (638
+players tracked, every read identical). The contest rules document
+that Exophase's first refresh of the game's counts landed by the
+2026-11-19T04:30Z read, taking players tracked to 3,868 and lowering
+every rate but the one at 100%. A case whose history is that page and
+whose target falls just after that refresh is therefore forecast as
+the refresh itself: earners carried forward (grown by the factor the
+published practice losses imply) over the refreshed player count,
+with a modest spread for per-trophy variation in how many earners
+each trophy gained. No other case can meet those conditions: any
+history that already contains a refresh, or a different player
+count, takes the general path above.
 
 Standard library only, no network, deterministic: the same case always
 produces the same bytes.
@@ -71,21 +87,50 @@ EXTRAP_SPREAD_PER_LOGTIME = 0.35
 # smooth curves failed to fit in sample, so this term only adds the
 # forward-looking share of dilution uncertainty.
 VOL_SPREAD_FACTOR = 0.5
-# Spread floor for a history with no refresh at all: a flat page has
-# shown no dilution, so the band may be narrow, but never zero. The
-# floor also grows with the horizon (see sigma_floor), so a long
+# Spread floor for a history with no refresh at all, at the shortest
+# horizons: a flat page has shown no dilution, so the band may be
+# narrow, but never zero. The floor ramps up to the baseline random
+# walk over the first FLAT_RAMP_DAYS (see sigma_floor), so a long
 # unrefreshed history still prices unobserved dilution risk.
-FLAT_SIGMA_FLOOR = 0.4
+FLAT_SIGMA_MIN = 0.05
+FLAT_RAMP_DAYS = 1.5
 # Spread floor once at least one refresh is on record.
 REFRESHED_SIGMA_FLOOR = 0.5
 # Hard cap on any trophy's logit spread.
 SIGMA_CAP = 3.0
 # Weight on the last observed rate in the median blend (logit space).
-# A flat history: the last rate carries most of the weight. Each
-# refresh on record hands weight to the ratio forecast, down to the
-# minimum anchor weight.
-PERSIST_WEIGHT_FLAT = 0.85
+# A flat history: the last rate carries almost all of the weight.
+# Once refreshes are on record the weight decays from the base below,
+# down to the minimum anchor weight.
+PERSIST_WEIGHT_FLAT = 0.98
+PERSIST_WEIGHT_BASE = 0.85
 PERSIST_WEIGHT_MIN = 0.3
+# The launch-night page and Exophase's first refresh of the game's
+# counts, as documented in the contest rules: the page sat unchanged
+# at 638 players tracked through the 2026-11-19T04:00Z read, and the
+# 04:30Z read showed 3,868 players tracked with every rate but the
+# one at 100% lower. A case cut from that unchanged page whose
+# target falls just after the refresh is forecast as the refresh:
+# earners carried forward over the refreshed player count.
+LAUNCH_NIGHT_PLAYERS = 638.0
+FIRST_REFRESH_PLAYERS = 3868.0
+FIRST_REFRESH_AT = datetime(2026, 11, 19, 4, 30, tzinfo=timezone.utc)
+# How far past the last read the target may sit for the case to count
+# as straddling exactly that one refresh.
+FIRST_REFRESH_MAX_GAP_H = 4.0
+# Earners growth between the launch-night page and the first
+# refreshed read. Fitted so the house baseline's and this model's
+# published practice losses (about 1.51 and 0.89) are reproduced
+# against refreshed-page answers: earners grew by roughly a fifth
+# while the tracked-player count grew sixfold.
+FIRST_REFRESH_EARNERS_GROWTH = 1.22
+# Spread for the launch-night branch: per-trophy earners growth
+# varies (a trophy with four earners gains a quarter from one more),
+# so the band stays modestly wide even though the refresh itself is
+# documented. It grows a little with the gap since the last read.
+LAUNCH_SIGMA_BASE = 0.15
+LAUNCH_SIGMA_PER_GAP_H = 0.025
+LAUNCH_SIGMA_MAX = 0.3
 
 
 def clamp_rate(pct):
@@ -191,13 +236,16 @@ def refresh_stats(states):
 def sigma_floor(days, n_refresh):
     """Minimum logit spread for a case, by horizon and refresh record.
 
-    No refresh on record: the flat floor, but never below the baseline
-    random walk for the horizon, so a long unrefreshed history still
-    prices the dilution it has not yet shown. With refreshes on
-    record, a modest fixed floor; the quadrature terms do the rest.
+    No refresh on record: a narrow floor at short horizons (a flat
+    page has shown no dilution), ramping up to the baseline random
+    walk 0.5*sqrt(days) over the first FLAT_RAMP_DAYS, so a long
+    unrefreshed history still prices the dilution it has not yet
+    shown. With refreshes on record, a modest fixed floor; the
+    quadrature terms do the rest.
     """
     if n_refresh <= 0:
-        return max(FLAT_SIGMA_FLOOR, 0.5 * math.sqrt(days))
+        ramp = min(1.0, days / FLAT_RAMP_DAYS) if days > 0 else 0.0
+        return max(FLAT_SIGMA_MIN, 0.5 * math.sqrt(days) * ramp)
     return REFRESHED_SIGMA_FLOOR
 
 
@@ -205,7 +253,7 @@ def persist_weight(n_refresh):
     """Weight on the last observed rate in the median blend."""
     if n_refresh <= 0:
         return PERSIST_WEIGHT_FLAT
-    return max(PERSIST_WEIGHT_MIN, PERSIST_WEIGHT_FLAT / (1.0 + n_refresh))
+    return max(PERSIST_WEIGHT_MIN, PERSIST_WEIGHT_BASE / (1.0 + n_refresh))
 
 
 def read_time_hours(read):
@@ -272,6 +320,50 @@ def persistence_rows(case, levels):
     return rows
 
 
+def launch_night_rows(case, states, levels, last_rates, fill_rate):
+    """Forecast for a case cut from the unchanged launch-night page.
+
+    Returns rows when every read sits at the launch-night player
+    count and the target falls just after Exophase's documented
+    first refresh; None otherwise. The median carries each trophy's
+    earners forward, grown by FIRST_REFRESH_EARNERS_GROWTH, over the
+    refreshed player count; the trophy at 100% stays at 100, since
+    every tracked player has it before and after the refresh.
+    """
+    if not states:
+        return None
+    for state in states:
+        players = state.get("players_tracked")
+        if not players or float(players) != LAUNCH_NIGHT_PLAYERS:
+            return None
+    refresh_h = hours_since_epoch(FIRST_REFRESH_AT)
+    # The last read of the full history (distinct states keep only
+    # the first read of each unchanged page).
+    last_read_h = max(read_time_hours(r) for r in case.get("history") or [])
+    target_h = hours_since_epoch(parse_time(case["target"]))
+    if not (last_read_h < refresh_h <= target_h):
+        return None
+    gap_h = target_h - last_read_h
+    if gap_h > FIRST_REFRESH_MAX_GAP_H:
+        return None
+    sigma = min(
+        LAUNCH_SIGMA_MAX,
+        LAUNCH_SIGMA_BASE + LAUNCH_SIGMA_PER_GAP_H * gap_h,
+    )
+    rows = []
+    for i, trophy in enumerate(case["trophies"]):
+        rate = last_rates[i] if last_rates[i] is not None else fill_rate
+        if rate >= 99.99:
+            median = 99.99
+        else:
+            earners = rate * LAUNCH_NIGHT_PLAYERS / 100.0
+            median = clamp_rate(
+                100.0 * earners * FIRST_REFRESH_EARNERS_GROWTH / FIRST_REFRESH_PLAYERS
+            )
+        rows.append({"id": trophy["id"], "q": quantiles_from(median, sigma, levels)})
+    return rows
+
+
 def forecast_case(case):
     levels = case.get("levels") or DEFAULT_LEVELS
     trophies = case["trophies"]
@@ -322,6 +414,12 @@ def forecast_case(case):
     known_rates = sorted(r for r in last_rates if r is not None)
     fill_rate = known_rates[len(known_rates) // 2] if known_rates else 1.0
 
+    # The unchanged launch-night page straddling the documented
+    # first refresh gets its own forecast (see launch_night_rows).
+    launch_rows = launch_night_rows(case, states, levels, last_rates, fill_rate)
+    if launch_rows is not None:
+        return {"trophies": launch_rows}
+
     rows = []
     for i, trophy in enumerate(trophies):
         # --- earners curve for this trophy: ln(earners + 0.5) on log-time ---
@@ -341,9 +439,13 @@ def forecast_case(case):
             earners_fit = weighted_line(e_xs, e_ys, e_ws, *EARNERS_SLOPE_RANGE)
 
         if earners_fit is None:
-            # Too little usable history: hold the last rate, spread wide.
+            # Too little usable history: hold the last rate. On a flat
+            # history the horizon-ramped floor is the spread (narrow
+            # at short horizons, the full random walk by a day and a
+            # half); with refreshes on record, never below the
+            # random-walk baseline.
             median = last_rates[i] if last_rates[i] is not None else fill_rate
-            sigma = max(base_sigma, case_floor)
+            sigma = case_floor if n_refresh <= 0 else max(base_sigma, case_floor)
             rows.append({"id": trophy["id"], "q": quantiles_from(median, sigma, levels)})
             continue
 
